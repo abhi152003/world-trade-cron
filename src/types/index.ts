@@ -93,4 +93,30 @@ export interface UserTradeValueUpdate {
   pnlPercentage: string;
   updatedAt: Date;
   blockchainTxHash?: string;
+}
+
+// New interfaces for stakes functionality
+export interface StakeRecord {
+  stakeAmount: number;
+  timestamp: string | Date;
+  exitTimestamp: string | Date;
+  transactionId?: string;
+}
+
+export interface UserStakes {
+  _id: string;
+  walletAddress: string;
+  username: string;
+  createdAt: Date;
+  lastStakeAt: Date;
+  stakes: StakeRecord[];
+}
+
+export interface StakeExitData {
+  walletAddress: string;
+  stakeIndex: number;
+  stakeRecord: StakeRecord;
+  signals: BacktestingSignal[];
+  totalPnL: string;
+  finalTradeValue: string;
 } 

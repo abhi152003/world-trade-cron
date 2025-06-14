@@ -1,5 +1,5 @@
 import { MongoClient, Db, Collection } from 'mongodb';
-import { Influencer, BacktestingSignal, ProcessedSignalRecord, UserSignalSummary, UserTradeValueUpdate } from '../types/index.js';
+import { Influencer, BacktestingSignal, ProcessedSignalRecord, UserSignalSummary, UserTradeValueUpdate, UserStakes, StakeRecord } from '../types/index.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -9,6 +9,7 @@ class DatabaseManager {
   private influencersDb: Db | null = null;
   private backtestingDb: Db | null = null;
   private signalTrackingDb: Db | null = null;
+  private worldStakingDb: Db | null = null;
 
   constructor(private mongoUri: string) {}
 
@@ -29,6 +30,7 @@ class DatabaseManager {
       this.influencersDb = this.client.db(process.env.INFLUENCERS_DB_NAME || 'influencers_db');
       this.backtestingDb = this.client.db(process.env.BACKTESTING_DB_NAME || 'backtesting_db');
       this.signalTrackingDb = this.client.db(process.env.SIGNAL_TRACKING_DB_NAME || 'signal_tracking_db');
+      this.worldStakingDb = this.client.db(process.env.WORLD_STAKING_DB_NAME || 'world-staking');
       
       console.log('Successfully connected to MongoDB');
     } catch (error) {
@@ -48,6 +50,7 @@ class DatabaseManager {
         this.influencersDb = null;
         this.backtestingDb = null;
         this.signalTrackingDb = null;
+        this.worldStakingDb = null;
         console.log('Disconnected from MongoDB');
       }
     } catch (error) {
@@ -104,6 +107,16 @@ class DatabaseManager {
       throw new Error('Not connected to signal tracking database');
     }
     return this.signalTrackingDb.collection<UserTradeValueUpdate>('trade_value_updates');
+  }
+
+  /**
+   * Gets the stakes collection from world-staking database
+   */
+  getStakesCollection(): Collection<UserStakes> {
+    if (!this.worldStakingDb) {
+      throw new Error('Not connected to world staking database');
+    }
+    return this.worldStakingDb.collection<UserStakes>('stakes');
   }
 
   /**
@@ -364,6 +377,99 @@ class DatabaseManager {
       } catch (error) {
         console.error(`Failed to get signals for influencer ${influencer.name}:`, error);
         // Continue with other influencers even if one fails
+      }
+    }
+
+    return signalsMap;
+  }
+
+  /**
+   * Gets all user stakes from the world-staking database
+   */
+  async getAllUserStakes(): Promise<UserStakes[]> {
+    try {
+      const collection = this.getStakesCollection();
+      const userStakes = await collection.find({}).toArray();
+      
+      console.log(`Retrieved ${userStakes.length} users with stakes from world-staking database`);
+      return userStakes;
+    } catch (error) {
+      console.error('Error retrieving user stakes:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Gets stakes that have passed their exit timestamp
+   */
+  async getStakesReadyToExit(): Promise<{ userStakes: UserStakes; readyStakes: { index: number; stake: StakeRecord }[] }[]> {
+    try {
+      const allUserStakes = await this.getAllUserStakes();
+      const currentTime = new Date();
+      const readyToExitStakes: { userStakes: UserStakes; readyStakes: { index: number; stake: StakeRecord }[] }[] = [];
+
+      for (const userStakes of allUserStakes) {
+        const readyStakes: { index: number; stake: StakeRecord }[] = [];
+        
+        for (let i = 0; i < userStakes.stakes.length; i++) {
+          const stake = userStakes.stakes[i];
+          const exitTimestamp = new Date(stake.exitTimestamp);
+          
+          if (currentTime >= exitTimestamp) {
+            readyStakes.push({ index: i, stake });
+          }
+        }
+
+        if (readyStakes.length > 0) {
+          readyToExitStakes.push({ userStakes, readyStakes });
+        }
+      }
+
+      console.log(`Found ${readyToExitStakes.length} users with stakes ready to exit`);
+      return readyToExitStakes;
+    } catch (error) {
+      console.error('Error getting stakes ready to exit:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Gets signals for all influencers within stake time ranges
+   */
+  async getSignalsForStakeRanges(
+    stakeRecords: { userStakes: UserStakes; readyStakes: { index: number; stake: StakeRecord }[] }[]
+  ): Promise<Map<string, BacktestingSignal[]>> {
+    const signalsMap = new Map<string, BacktestingSignal[]>();
+
+    // Get all influencers first
+    const influencers = await this.getAllInfluencers();
+
+    for (const influencer of influencers) {
+      // Collect all date ranges we need for this influencer
+      const dateRanges: { fromDate: Date; toDate: Date }[] = [];
+
+      for (const userStakeData of stakeRecords) {
+        for (const readyStake of userStakeData.readyStakes) {
+          const fromDate = new Date(readyStake.stake.timestamp);
+          const toDate = new Date(readyStake.stake.exitTimestamp);
+          dateRanges.push({ fromDate, toDate });
+        }
+      }
+
+      if (dateRanges.length === 0) continue;
+
+      try {
+        // Find the overall min and max dates for this influencer
+        const minDate = new Date(Math.min(...dateRanges.map(range => range.fromDate.getTime())));
+        const maxDate = new Date(Math.max(...dateRanges.map(range => range.toDate.getTime())));
+
+        // Get all signals in the overall range for efficiency
+        const signals = await this.getSignalsInDateRange(influencer.name, minDate, maxDate);
+        signalsMap.set(influencer.name, signals);
+        
+        console.log(`Retrieved ${signals.length} signals for ${influencer.name} in date range ${minDate.toISOString()} to ${maxDate.toISOString()}`);
+      } catch (error) {
+        console.error(`Failed to get signals for influencer ${influencer.name}:`, error);
       }
     }
 

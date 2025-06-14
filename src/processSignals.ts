@@ -2,32 +2,32 @@ import dotenv from 'dotenv';
 import databaseManager from './utils/database.js';
 import BlockchainManager from './utils/blockchain.js';
 import {
-  processAllInfluencerSignals,
-  generateProcessingSummary
-} from './utils/signalProcessor.js';
+  processStakeExits,
+  generateStakeExitSummary
+} from './utils/stakeExitProcessor.js';
 
 // Load environment variables
 dotenv.config();
 
 interface ProcessingStats {
-  totalInfluencers: number;
-  totalSubscribers: number;
-  subscribersWithSignals: number;
-  totalBlockchainUpdates: number;
+  totalUsersWithStakes: number;
+  totalStakes: number;
+  stakesReadyToExit: number;
+  totalBlockchainExits: number;
   totalBlockchainErrors: number;
   startTime: Date;
   endTime?: Date;
 }
 
 /**
- * Main function to process signals and update blockchain trades
+ * Main function to process stake exits based on exitTimestamp
  */
 export async function processSignalsMain(): Promise<ProcessingStats> {
   const stats: ProcessingStats = {
-    totalInfluencers: 0,
-    totalSubscribers: 0,
-    subscribersWithSignals: 0,
-    totalBlockchainUpdates: 0,
+    totalUsersWithStakes: 0,
+    totalStakes: 0,
+    stakesReadyToExit: 0,
+    totalBlockchainExits: 0,
     totalBlockchainErrors: 0,
     startTime: new Date()
   };
@@ -35,7 +35,7 @@ export async function processSignalsMain(): Promise<ProcessingStats> {
   let blockchainManager: BlockchainManager | null = null;
 
   try {
-    console.log('🚀 Starting signal processing...');
+    console.log('🚀 Starting stake exit processing...');
     console.log(`Start time: ${stats.startTime.toISOString()}`);
 
     // Validate required environment variables
@@ -66,35 +66,43 @@ export async function processSignalsMain(): Promise<ProcessingStats> {
       throw new Error('Database health check failed');
     }
 
-    // Debug database state before processing
-    await databaseManager.debugDatabaseState();
-
-    // Step 1: Retrieve all influencers and their subscribers
-    console.log('👥 Fetching influencers and subscribers...');
-    const influencers = await databaseManager.getAllInfluencers();
-    stats.totalInfluencers = influencers.length;
+    // Step 1: Get all user stakes from world-staking database
+    console.log('💰 Fetching user stakes from world-staking database...');
+    const allUserStakes = await databaseManager.getAllUserStakes();
+    stats.totalUsersWithStakes = allUserStakes.length;
     
-    // Calculate total subscribers
-    stats.totalSubscribers = influencers.reduce(
-      (total, influencer) => {
-        const subscriberCount = influencer.subscribers && Array.isArray(influencer.subscribers) 
-          ? influencer.subscribers.length 
-          : 0;
-        return total + subscriberCount;
-      },
+    // Calculate total stakes
+    stats.totalStakes = allUserStakes.reduce(
+      (total, userStakes) => total + userStakes.stakes.length,
       0
     );
 
-    console.log(`Found ${stats.totalInfluencers} influencers with ${stats.totalSubscribers} total subscribers`);
+    console.log(`Found ${stats.totalUsersWithStakes} users with ${stats.totalStakes} total stakes`);
 
-    if (stats.totalInfluencers === 0) {
-      console.log('No influencers found in database');
+    if (stats.totalUsersWithStakes === 0) {
+      console.log('No user stakes found in database');
       return stats;
     }
 
-    // Step 2: Get relevant signals for all influencers
-    console.log('Fetching relevant signals from backtesting database...');
-    const signalsMap = await databaseManager.getRelevantSignals(influencers);
+    // Step 2: Get stakes that have passed their exit timestamp
+    console.log('⏰ Checking for stakes ready to exit...');
+    const stakesReadyToExit = await databaseManager.getStakesReadyToExit();
+    
+    stats.stakesReadyToExit = stakesReadyToExit.reduce(
+      (total, userStakeData) => total + userStakeData.readyStakes.length,
+      0
+    );
+
+    console.log(`Found ${stats.stakesReadyToExit} stakes ready to exit across ${stakesReadyToExit.length} users`);
+
+    if (stats.stakesReadyToExit === 0) {
+      console.log('No stakes are ready to exit at this time');
+      return stats;
+    }
+
+    // Step 3: Get relevant signals for stake time ranges
+    console.log('📊 Fetching signals for stake time ranges...');
+    const signalsMap = await databaseManager.getSignalsForStakeRanges(stakesReadyToExit);
     
     const totalSignalsFound = Array.from(signalsMap.values()).reduce(
       (total, signals) => total + signals.length,
@@ -102,51 +110,52 @@ export async function processSignalsMain(): Promise<ProcessingStats> {
     );
     console.log(`Found ${totalSignalsFound} total signals across all influencers.`);
 
-    // Step 3: Process signals for each subscriber (within 7-day windows)
-    console.log('Processing signals for subscribers (within 7-day windows from subscription)...');
-    const subscriberResults = await processAllInfluencerSignals(influencers, signalsMap);
-    stats.subscribersWithSignals = subscriberResults.size;
+    // Step 4: Process stake exits and calculate final trade values
+    console.log('🔄 Processing stake exits and calculating final trade values...');
+    const stakeExitResults = await processStakeExits(stakesReadyToExit, signalsMap);
 
     // Generate and display processing summary
-    const summary = generateProcessingSummary(subscriberResults);
+    const summary = generateStakeExitSummary(stakeExitResults);
     console.log(summary);
 
-    if (stats.subscribersWithSignals === 0) {
-      console.log('No subscribers with new signals found');
+    if (stakeExitResults.length === 0) {
+      console.log('No stake exits to process');
       return stats;
     }
 
-    // Step 4: Update blockchain trades based on processed signals
-    console.log('Updating blockchain trades...');
+    // Step 5: Exit trades on blockchain
+    console.log('🏁 Exiting trades on blockchain...');
     
-    for (const [subscriberAddress, result] of subscriberResults) {
+    for (const stakeExitData of stakeExitResults) {
       try {
         console.log(
-          `Updating trades for ${subscriberAddress}: ` +
-          `${result.newSignalsCount} new signals processed, total cumulative P&L: ${result.totalSumPnL}`
+          `Exiting trade for ${stakeExitData.walletAddress}[${stakeExitData.stakeIndex}]: ` +
+          `${stakeExitData.signals.length} signals processed, total P&L: ${stakeExitData.totalPnL}, ` +
+          `final trade value: ${stakeExitData.finalTradeValue}`
         );
 
-        const updateResult = await blockchainManager.updateUserTradesWithSignals(
-          subscriberAddress as `0x${string}`,
-          result.totalSumPnL
+        // Convert final trade value string to BigInt (already in wei)
+        const finalTradeValueWei = BigInt(stakeExitData.finalTradeValue);
+
+        const exitResult = await blockchainManager.exitTrade(
+          stakeExitData.walletAddress as `0x${string}`,
+          stakeExitData.stakeIndex,
+          finalTradeValueWei
         );
 
-        stats.totalBlockchainUpdates += updateResult.updated;
-        stats.totalBlockchainErrors += updateResult.errors;
+        if (exitResult) {
+          stats.totalBlockchainExits++;
+          console.log(`Successfully exited trade for ${stakeExitData.walletAddress}[${stakeExitData.stakeIndex}]`);
+        } else {
+          stats.totalBlockchainErrors++;
+          console.error(`Failed to exit trade for ${stakeExitData.walletAddress}[${stakeExitData.stakeIndex}]`);
+        }
 
-        console.log(
-          `Updated ${updateResult.updated} trades for ${subscriberAddress}` +
-          (updateResult.errors > 0 ? ` (${updateResult.errors} errors)` : '')
-        );
-
-        // Debug the user signal summary after processing
-        await databaseManager.debugUserSignalSummary(subscriberAddress);
-
-        // Add delay between users to avoid overwhelming the network
+        // Add delay between exits to avoid overwhelming the network
         await new Promise(resolve => setTimeout(resolve, 2000));
 
       } catch (error) {
-        console.error(`Error updating trades for ${subscriberAddress}:`, error);
+        console.error(`Error exiting trade for ${stakeExitData.walletAddress}[${stakeExitData.stakeIndex}]:`, error);
         stats.totalBlockchainErrors++;
       }
     }
@@ -154,20 +163,20 @@ export async function processSignalsMain(): Promise<ProcessingStats> {
     stats.endTime = new Date();
     const duration = stats.endTime.getTime() - stats.startTime.getTime();
 
-    console.log('\nSignal processing completed successfully!');
+    console.log('\nStake exit processing completed successfully!');
     console.log(`End time: ${stats.endTime.toISOString()}`);
     console.log(`Total duration: ${Math.round(duration / 1000)} seconds`);
     console.log('\n📈 Final Statistics:');
-    console.log(`- Influencers processed: ${stats.totalInfluencers}`);
-    console.log(`- Total subscribers: ${stats.totalSubscribers}`);
-    console.log(`- Subscribers with signals: ${stats.subscribersWithSignals}`);
-    console.log(`- Successful blockchain updates: ${stats.totalBlockchainUpdates}`);
-    console.log(`- Blockchain update errors: ${stats.totalBlockchainErrors}`);
+    console.log(`- Users with stakes: ${stats.totalUsersWithStakes}`);
+    console.log(`- Total stakes: ${stats.totalStakes}`);
+    console.log(`- Stakes ready to exit: ${stats.stakesReadyToExit}`);
+    console.log(`- Successful blockchain exits: ${stats.totalBlockchainExits}`);
+    console.log(`- Blockchain exit errors: ${stats.totalBlockchainErrors}`);
 
     return stats;
 
   } catch (error) {
-    console.error('Fatal error during signal processing:', error);
+    console.error('Fatal error during stake exit processing:', error);
     stats.endTime = new Date();
     throw error;
   } finally {
